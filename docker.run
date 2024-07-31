@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+
+set -e
+
+if [[ $USER != "root" ]]; then
+  _error '该脚本需要使用 root 权限运行。'
+  exit 1
+fi
+
+lines=312
+tarball_md5=be146ac2fbe8a548b0a8ccd38ef8fb1f
+docker_service_content="
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+After=network-online.target firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+# the default is not to use systemd for cgroups because the delegate issues still
+# exists and systemd currently does not support the cgroup feature set required
+# for containers run by docker
+ExecStart=/usr/local/bin/dockerd 
+ExecReload=/bin/kill -s HUP $MAINPID
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+# Uncomment TasksMax if your systemd version supports it.
+# Only systemd 226 and above support this version.
+#TasksMax=infinity
+TimeoutStartSec=0
+# set delegate yes so that systemd does not reset the cgroups of docker containers
+Delegate=yes
+# kill only the docker process, not all processes in the cgroup
+KillMode=process
+# restart the docker process if it exits prematurely
+Restart=on-failure
+StartLimitBurst=3
+StartLimitInterval=60s
+
+[Install]
+WantedBy=multi-user.target"
+
+function _log() {
+    local log_level_int=$1
+    local log_level_str=$2
+    local message=${@:3}
+
+    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+
+    local color_reset='\033[0m'
+    local color_red='\033[0;31m'
+    local color_white='\033[1;37m'
+
+    local color=""
+    if [ "$log_level_str" == "ERROR" ]; then
+        color=$color_red
+    elif [ "$log_level_str" == "INFO" ]; then
+        color=$color_white
+    fi
+
+    local log_message="[$timestamp] [$log_level_str] - $message"
+    echo -e "${color}${log_message}${color_reset}" | tee -a "${PWD}/${0}.log"
+}
+
+function _error() {
+    _log 1 "ERROR" "$@"
+}
+
+function _info() {
+    _log 0 "INFO" "$@"
+}
+
+function parse_args() {
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --safe-mode)
+        SAFE_MODE=1
+        shift
+        ;;
+      --tz)
+        TZ="$2"
+        shift
+        ;;
+      *)
+        _error "不支持的标签: $1"
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
+
+function is_exist() {
+  local missing_files=()
+
+  for file in "$@"; do
+    if [[ ! -e "$file" ]]; then
+      missing_files+=("$file")
+    fi
+  done
+
+  if [[ ${#missing_files[@]} -ne 0 ]]; then
+    _error "以下文件或文件夹不存在："
+    for missing_file in "${missing_files[@]}"; do
+      _error "$missing_file"
+    done
+    exit 1
+  fi
+}
+
+function disable_selinux() {
+
+    if ! command -v getenforce &> /dev/null; then
+        return 0
+    else
+        current_status=$(getenforce)
+    fi
+    
+    _info "开始关闭 SELinux"
+
+    if [[ "$current_status" == "Disabled" ]]; then
+        _info "SELinux 已经关闭。"
+        return 0
+    fi
+
+    setenforce 0
+    
+    if [[ $? -ne 0 ]]; then
+        _error "更改 SElinux 模式失败. 请检查你的权限。"
+        return 1
+    else
+      _info "SELinux 模式已临时关闭。"
+    fi
+    
+    sudo sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+    
+    if grep -q "^SELINUX=disabled" /etc/selinux/config; then
+        _info "SELinux 已经设置为开机默认关闭，将在下一次重启后生效。"
+    else
+        _error "关闭 SElinux 失败 ，请检查 /etc/selinux/config 文件。"
+        return 1
+    fi
+
+    _info "SELinux 已关闭。"
+}
+
+function disable_firewalld() {
+
+    if ! systemctl list-units --type=service | grep -q firewalld; then
+        return 0
+    fi
+
+    _info "开始关闭 Firewalld"
+
+    systemctl is-active --quiet firewalld
+    if [[ $? -ne 0 ]]; then
+        _info "Firewalld 已经关闭。"
+    else
+        systemctl stop firewalld
+        if [[ $? -eq 0 ]]; then
+            _info "已成功关闭 Firewalld"
+        else
+            _error "关闭 Firewalld 失败。"
+            return 1
+        fi
+    fi
+
+    systemctl disable firewalld
+    if [[ $? -eq 0 ]]; then
+        _info "成功取消 Firewalld 开机自启。"
+    else
+        _error "取消 Firewalld 开机自启失败。"
+        return 1
+    fi
+
+    _info "Firewalld 已关闭。"
+}
+
+function change_timezone() {
+    _info "开始设置时区"
+    local timezone=$1
+
+    if [ ! -f "/usr/share/zoneinfo/$timezone" ]; then
+        _error "无效的时区：$timezone"
+        return 1
+    fi
+
+    ln -sf /usr/share/zoneinfo/$timezone /etc/localtime
+
+    echo "$timezone" | tee /etc/timezone
+    _info "时区设置完成"
+}
+
+function extract_docker_package() {
+
+  _info "开始解解压安装资源"
+
+  tail -n+${lines} $0 > docker.tar.xz
+  md5=$(md5sum docker.tar.xz | cut -d' ' -f1)
+
+  if [[ "$md5" != "$tarball_md5" ]]; then
+      _error "md5 校验失败"
+      return 1
+  fi
+
+  tar -vxf docker.tar.xz
+  chmod +x docker/*
+
+  _info "解压完成"
+}
+
+function install_docker() {
+
+  _info  "开始安装 Docker"
+
+  if command -v docker &>/dev/null; then
+      _info "Docker 已存在，跳过安装"
+      return 0
+  fi
+
+  for i in docker/*; do
+      if [[ $(basename "$i") != "docker-compose" ]]; then
+          install -m 0755 "$i" /usr/local/bin/
+      fi
+  done
+
+  echo "$docker_service_content" | tee /etc/systemd/system/docker.service > /dev/null
+
+  _info "docker 安装完成"
+}
+
+function install_docker_compose() {
+
+  _info  "开始安装 Docker Compose"
+
+  if [[ ! -x docker/docker-compose ]] && docker compose version &>/dev/null; then
+      _info "Docker Compose 已存在，跳过安装"
+      return 0
+  fi
+
+  [[ -d /usr/local/lib/docker/cli-plugins ]] || mkdir -p /usr/local/lib/docker/cli-plugins
+
+  mv docker/docker-compose /usr/local/lib/docker/cli-plugins/
+
+  if ! grep -q "alias docker-compose='docker compose'" "${HOME}/.bashrc"; then
+      echo "alias docker-compose='docker compose'" >> "${HOME}/.bashrc"
+      source "${HOME}/.bashrc"
+  fi
+
+  _info "Docker Compose 安装完成"
+
+}
+
+function start_all(){
+
+  _info "开始启动 Docker 并且设置开机自启"
+
+  systemctl daemon-reload
+  systemctl enable --now docker
+
+  _info "Docker 启动完成"
+}
+
+function clean() {
+  
+  _info "开始清理临时文件"
+
+  items=("docker.tar.xz"  "docker")
+
+  for item in "${items[@]}"; do
+    if [[ -d "$item" ]]; then
+      rm -rf "$item"
+    elif [[ -f "$item" ]]; then
+      rm -f "$item"
+    else
+      _info "$item 不存在。"
+    fi
+  done
+
+  _info "清理完成"
+}
+
+parse_args "$@"
+
+_info "${0##*/} 开始安装"
+
+if [[ -z ${SAFE_MODE+x} ]];then 
+  _info "开始关闭会影响 docker 使用的安全配置"
+
+  disable_selinux
+  disable_firewalld
+
+  _info "已关闭会影响 docker 使用的安全配置"
+fi
+
+if [[ ${TZ} ]];then
+  change_timezone ${TZ}
+fi
+
+extract_docker_package
+install_docker
+install_docker_compose
+start_all
+clean
+
+_info "恭喜，${0##*/} 安装完成。"
+exit 0
