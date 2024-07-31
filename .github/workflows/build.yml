@@ -1,0 +1,23 @@
+name: build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run a multi-line script
+        run: |
+          chmod +x ./buildDockerInstall.sh
+          ./buildDockerInstall.sh --arch x86_64
+          ./buildDockerInstall.sh --arch aarch64
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ./docker_*.install
