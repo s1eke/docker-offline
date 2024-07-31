@@ -8,7 +8,7 @@ if [[ $USER != "root" ]]; then
 fi
 
 lines=312
-tarball_md5=1bc0a91de2e3717d8d818374d9e193a7
+tarball_md5=0e03ec48c1cba3e4aa07489fa9f7509b
 docker_service_content="
 [Unit]
 Description=Docker Application Container Engine
