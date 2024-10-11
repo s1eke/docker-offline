@@ -2,8 +2,8 @@
 
 set -e
 
-COMPOSE_VERSION=v2.29.1
-DOCKER_VERSION=27.1.1
+COMPOSE_VERSION=v2.29.7
+DOCKER_VERSION=27.3.1
 DOCKER_MIRROR=
 lines=$(awk 'END {print NR+1}' docker.run)
 
